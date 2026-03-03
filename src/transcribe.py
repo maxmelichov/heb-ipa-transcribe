@@ -23,6 +23,7 @@ import multiprocessing
 import queue
 import time
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,14 +46,15 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
         sr = 16000
 
         # Initialize Models
-        # device_index=0 because CUDA_VISIBLE_DEVICES restricts the view to only this GPU
-        ipa_model = WhisperModel(ipa_model_id, device=device, device_index=0, compute_type=compute_type)
-        text_model = WhisperModel(text_model_id, device=device, device_index=0, compute_type=compute_type)
+        # Using 1 intra_op_threads and multiple concurrent inferences is best for CTranslate2 GPU throughput
+        ipa_model = WhisperModel(ipa_model_id, device=device, device_index=0, compute_type=compute_type, num_workers=1, cpu_threads=2)
+        text_model = WhisperModel(text_model_id, device=device, device_index=0, compute_type=compute_type, num_workers=1, cpu_threads=2)
         vad_model = load_silero_vad()
         
         print(f"✅ Worker {worker_id} Ready!")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        # Start thread pool here to avoid recreation per file
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             while True:
                 task = input_queue.get() 
                 if task is None: # Sentinel to stop
@@ -61,64 +63,61 @@ def gpu_worker(worker_id: int, target_gpu: int, input_queue: multiprocessing.Que
                 audio_path_str, relative_path = task
                 
                 try:
-                    # 1. Load Audio
-                    array, sampling_rate = sf.read(audio_path_str, dtype='float32')
-                    if sampling_rate != sr:
-                        array = librosa.resample(array, orig_sr=sampling_rate, target_sr=sr)
-                    audio = array
+                    # 1. Load Audio (optimized zero-copy)
+                    audio, sr_orig = sf.read(audio_path_str, dtype='float32', always_2d=False)
+                    if sr_orig != sr:
+                        audio = librosa.resample(audio, orig_sr=sr_orig, target_sr=sr)
 
                     wav_tensor = torch.from_numpy(audio)
                     
                     # 2. VAD & Chunking
                     timestamps = get_speech_timestamps(wav_tensor, vad_model, return_seconds=True, sampling_rate=sr)
                     
-                    chunks = []
-                    for ts in timestamps:
+                    if not timestamps:
+                        result_queue.put({
+                            'filename': relative_path,
+                            'text': "",
+                            'phonemes': "",
+                            'processed_at': datetime.now().isoformat()
+                        })
+                        continue
+
+                    # Pre-allocate and slice chunks
+                    merged_chunks = []
+                    current_start = int(timestamps[0]["start"] * sr)
+                    current_end = int(timestamps[0]["end"] * sr)
+                    max_samples = max_chunk_s * sr
+
+                    for ts in timestamps[1:]:
                         chunk_start = int(ts["start"] * sr)
                         chunk_end = int(ts["end"] * sr)
-                        max_samples = max_chunk_s * sr
-                        while chunk_end - chunk_start > max_samples:
-                            chunks.append((chunk_start, chunk_start + max_samples))
-                            chunk_start += max_samples
-                        if chunk_end > chunk_start:
-                            chunks.append((chunk_start, chunk_end))
+                        
+                        if (chunk_end - current_start) <= max_samples:
+                            current_end = chunk_end
+                        else:
+                            merged_chunks.append(audio[current_start:current_end])
+                            current_start, current_end = chunk_start, chunk_end
+                    merged_chunks.append(audio[current_start:current_end])
 
-                    if not chunks:
-                        merged = []
-                    else:
-                        merged = []
-                        current_start, current_end = chunks[0]
-                        for chunk_start, chunk_end in chunks[1:]:
-                            if (chunk_end - current_start) <= max_chunk_s * sr:
-                                current_end = chunk_end
-                            else:
-                                merged.append((current_start, current_end))
-                                current_start, current_end = chunk_start, chunk_end
-                        merged.append((current_start, current_end))
-
-                    # 3. Transcribe
+                    # 3. Transcribe using thread pool mapping for batching chunks
                     full_text = []
                     full_ipa = []
 
-                    for chunk_start, chunk_end in merged:
-                        chunk = audio[chunk_start:chunk_end]
+                    def transcribe_both(chunk_audio):
+                        t_future = executor.submit(
+                            lambda c: " ".join(s.text.strip() for s in text_model.transcribe(c, beam_size=5, language=language, temperature=0, condition_on_previous_text=False)[0]).strip(), 
+                            chunk_audio
+                        )
+                        i_future = executor.submit(
+                            lambda c: " ".join(s.text.strip() for s in ipa_model.transcribe(c, beam_size=5, language=language, temperature=0, condition_on_previous_text=False, no_speech_threshold=0.1)[0]).strip(), 
+                            chunk_audio
+                        )
+                        return t_future.result(), i_future.result()
 
-                        def get_text(c):
-                            segs, _ = text_model.transcribe(c, beam_size=5, language=language, temperature=0, condition_on_previous_text=False)
-                            return " ".join(s.text.strip() for s in segs).strip()
-
-                        def get_ipa(c):
-                            segs, _ = ipa_model.transcribe(c, beam_size=5, language=language, temperature=0, condition_on_previous_text=False, no_speech_threshold=0.1)
-                            return " ".join(s.text.strip() for s in segs).strip()
-
-                        f_text = executor.submit(get_text, chunk)
-                        f_ipa = executor.submit(get_ipa, chunk)
-
-                        text_out = f_text.result()
-                        ipa_out = f_ipa.result()
-
-                        if text_out: full_text.append(text_out)
-                        if ipa_out: full_ipa.append(ipa_out)
+                    # Transcribe all merged chunks sequentially, but the two models run concurrently per chunk
+                    for t_out, i_out in map(transcribe_both, merged_chunks):
+                        if t_out: full_text.append(t_out)
+                        if i_out: full_ipa.append(i_out)
 
                     # 4. Send Result
                     result_queue.put({
